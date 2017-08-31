@@ -20,6 +20,8 @@
 
 int resolve_packet (void *in_pck, ssize_t in_size, void *out_pck, uint32_t *out_size, uint8_t ip_addr[4]);
 
+int generate_packet (void *pck, uint32_t *size, uint8_t saddr[4], uint8_t daddr[4]);
+
 int print_packet (void *pck);
 
 #endif /* _ICMP_PROTO_H_ */

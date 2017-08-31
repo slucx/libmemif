@@ -1059,6 +1059,7 @@ memif_delete (memif_conn_handle_t *conn)
                 c->listener_fd = ms->fd = -1;
                 free (ms->interface_list);
                 ms->interface_list = NULL;
+                unlink ((char *) ms->filename);
                 free (ms->filename);
                 ms->filename = NULL;
                 free (ms);
@@ -1318,7 +1319,6 @@ memif_buffer_alloc (memif_conn_handle_t conn, uint16_t qid,
             b0->data = c->regions->shm + ring->desc[s0].offset;
             b1->data = c->regions->shm + ring->desc[s1].offset;
 
-            DBG ("allocated ring slots %u, %u", s0, s1);
             count -= 2;
             ns -= 2;
             *count_out += 2;
@@ -1331,18 +1331,16 @@ memif_buffer_alloc (memif_conn_handle_t conn, uint16_t qid,
         b0->buffer_len = ring->desc[s0].buffer_length;
         b0->data = c->regions->shm + ring->desc[s0].offset;
 
-        DBG ("allocated ring slot %u", s0);
         count--;
         ns--;
         *count_out += 1;
     }
 
     mq->alloc_bufs += *count_out;
-            DBG ("allocated: %u/%u bufs. Total %u allocated bufs", *count_out, count, mq->alloc_bufs);
 
     if (count)
     {
-        DBG ("ring buffer full! qid: %u", qid);
+        /* DBG ("ring buffer full! qid: %u", qid); */
         err = MEMIF_ERR_NOBUF_RING;
     }
 

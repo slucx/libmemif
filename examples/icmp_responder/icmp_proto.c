@@ -237,3 +237,84 @@ resolve_packet (void *in_pck, ssize_t in_size,
     }
     return 0;
 }
+
+static ssize_t
+generate_eth (struct ether_header *eh)
+{
+    uint8_t hw_addr[6];
+    int i;
+    for (i = 0; i < 6; i++)
+    {
+        hw_addr[i] = 'a';
+    }
+    memcpy (eh->ether_shost, hw_addr, 6);
+    memcpy (eh->ether_dhost, hw_addr, 6);
+
+    eh->ether_type = 0x0800;
+    
+    return sizeof (struct ether_header);
+}
+
+static ssize_t
+generate_ip (struct iphdr *ip, uint8_t saddr[4], uint8_t daddr[4])
+{
+    ip->ihl = 5;
+    ip->version = 4;
+    ip->tos = 0;
+    /*len updated later */
+    ip->tot_len = 0x5400;
+    ip->id = 0;
+    ip->frag_off = 0;
+    ip->ttl = 0x40;
+    ip->protocol = 1;
+    /* saddr */
+    ((uint8_t *) &ip->saddr)[0] = saddr[0]; 
+    ((uint8_t *) &ip->saddr)[1] = saddr[1]; 
+    ((uint8_t *) &ip->saddr)[2] = saddr[2]; 
+    ((uint8_t *) &ip->saddr)[3] = saddr[3];
+    /* daddr */
+    ((uint8_t *) &ip->daddr)[0] = daddr[0]; 
+    ((uint8_t *) &ip->daddr)[1] = daddr[1]; 
+    ((uint8_t *) &ip->daddr)[2] = daddr[2]; 
+    ((uint8_t *) &ip->daddr)[3] = daddr[3]; 
+    
+    ip->check = cksum (ip, sizeof (struct iphdr));
+
+    return sizeof (struct iphdr);
+}
+
+static ssize_t
+generate_icmp (struct icmphdr *icmp)
+{
+    icmp->type = ICMP_ECHO;
+    icmp->code = 0;
+    /* shall see... */
+    icmp->un.echo.id = 0;
+    icmp->un.echo.sequence = 0;
+
+    return sizeof (struct icmphdr);
+}
+
+int
+generate_packet (void *pck, uint32_t *size, uint8_t saddr[4], uint8_t daddr[4])
+{
+    struct ether_header *eh;
+    struct iphdr *ip;
+    struct icmphdr *icmp;
+
+    *size = 0;
+
+    eh = (struct ether_header *) pck;
+    *size += generate_eth (eh);
+
+    ip = (struct iphdr *) (pck + *size);
+    *size += generate_ip (ip, saddr, daddr);
+
+    icmp = (struct icmphdr *) (pck + *size);
+    *size += generate_icmp (icmp);
+
+    ((struct icmphdr *)(pck + *size - sizeof (struct icmphdr)))->checksum =
+        cksum (pck + *size - sizeof (struct icmphdr), sizeof (struct icmphdr));
+
+    return 0;
+}

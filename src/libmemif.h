@@ -29,6 +29,12 @@
 
 #include <memif.h>
 
+/**
+ * @defgroup API_CALLS Api calls
+ *
+ * @{
+ */
+
 /*! Error codes */
 typedef enum
 {
@@ -73,6 +79,8 @@ typedef enum
     MEMIF_ERR_DISCONNECTED,         /*!< peer interface disconnected */
     MEMIF_ERR_UNKNOWN_MSG,          /*!< unknown message type */
 } memif_err_t;                                                                                   
+
+/** @} */
 
 /**
  * @defgroup MEMIF_FD_EVENT Types of events that need to be watched for specific fd.
@@ -244,7 +252,7 @@ typedef struct
 /** @} */
 
 /**
- * @defgroup API_CALLS Api calls
+ * @addtogroup API_CALLS Api calls
  *
  * @{
  */

@@ -43,6 +43,8 @@
 #include <errno.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/timerfd.h>
+#include <pthread.h>
 
 #include <libmemif.h>
 #include <icmp_proto.h>
@@ -67,10 +69,12 @@
                 } while (0)
 
 /* maximum tx/rx memif buffers */
-#define MAX_MEMIF_BUFS  256
+#define MAX_MEMIF_BUFS  1024
 #define MAX_CONNS       50
+#define MAX_THREADS     50
 
-int epfd;
+int epfd, timerfd;
+struct itimerspec arm;
 
 typedef struct
 {
@@ -89,10 +93,15 @@ typedef struct
     uint16_t rx_buf_num;
     /* interface ip address */
     uint8_t ip_addr[4];
+    uint8_t ip_daddr[4];
+
+    uint64_t pps_rx;
 } memif_connection_t;
 
 memif_connection_t memif_connection[MAX_CONNS];
 long ctx[MAX_CONNS];
+
+pthread_t thread[MAX_THREADS];
 
 /* print details for all memif connections */
 static void
@@ -306,7 +315,7 @@ icmpr_tx_burst (long index, uint16_t qid)
     err = memif_tx_burst (c->conn, qid, c->tx_bufs, c->tx_buf_num, &r);
     if (err != MEMIF_ERR_SUCCESS)
         INFO ("memif_tx_burst: %s", memif_strerror (err));
-    DBG ("tx: %d/%u", r, c->tx_buf_num);
+    /* DBG ("tx: %d/%u", r, c->tx_buf_num); */
     c->tx_buf_num -= r;
     return 0;
 }
@@ -327,42 +336,50 @@ on_interrupt (memif_conn_handle_t conn, void *private_ctx, uint16_t qid)
     uint16_t rx;
     uint16_t fb;
     /* receive data from shared memory buffers */
-    err = memif_rx_burst (c->conn, qid, c->rx_bufs, MAX_MEMIF_BUFS, &rx);
-    if (err != MEMIF_ERR_SUCCESS)
-    {
-        INFO ("memif_rx_burst: %s", memif_strerror (err));
+    do {
+        err = memif_rx_burst (c->conn, qid, c->rx_bufs, MAX_MEMIF_BUFS, &rx);
+        if ((err != MEMIF_ERR_SUCCESS) && (err != MEMIF_ERR_NOBUF))
+        {
+            INFO ("memif_rx_burst: %s", memif_strerror (err));
+            c->rx_buf_num += rx;
+            goto error;
+        }
         c->rx_buf_num += rx;
-        goto error;
+        c->pps_rx += rx;
+/*
+        DBG ("received %d buffers. %u/%u alloc/free buffers",
+                    rx, c->rx_buf_num, MAX_MEMIF_BUFS - c->rx_buf_num);
+*/
+/*
+        if (icmpr_buffer_alloc (index, rx, qid) < 0)
+        {
+            INFO ("buffer_alloc error");
+            goto error;
+        }
+        int i;
+        for (i = 0; i < rx; i++)
+        {
+            resolve_packet ((void *) (c->rx_bufs + i)->data,
+                                (c->rx_bufs + i)->data_len, (void *) (c->tx_bufs + i)->data,
+                                &(c->tx_bufs + i)->data_len, c->ip_addr);
+        }
+
+*/
+        err = memif_buffer_free (c->conn, qid, c->rx_bufs, rx, &fb);
+        if (err != MEMIF_ERR_SUCCESS)
+            INFO ("memif_buffer_free: %s", memif_strerror (err));
+        c->rx_buf_num -= fb;
+/*
+*/    
+/*
+        DBG ("freed %d buffers. %u/%u alloc/free buffers",
+                    fb, c->rx_buf_num, MAX_MEMIF_BUFS - c->rx_buf_num);
+*/
+/*
+       icmpr_tx_burst (index, qid);
+*/
     }
-    c->rx_buf_num += rx;
-
-    DBG ("received %d buffers. %u/%u alloc/free buffers",
-                rx, c->rx_buf_num, MAX_MEMIF_BUFS - c->rx_buf_num);
-
-    if (icmpr_buffer_alloc (index, rx, qid) < 0)
-    {
-        INFO ("buffer_alloc error");
-        goto error;
-    }
-    int i;
-    for (i = 0; i < rx; i++)
-    {
-        resolve_packet ((void *) (c->rx_bufs + i)->data,
-                            (c->rx_bufs + i)->data_len, (void *) (c->tx_bufs + i)->data,
-                            &(c->tx_bufs + i)->data_len, c->ip_addr);
-    }
-
-    /* mark memif buffers and shared memory buffers as free */
-    err = memif_buffer_free (c->conn, qid, c->rx_bufs, rx, &fb);
-    if (err != MEMIF_ERR_SUCCESS)
-        INFO ("memif_buffer_free: %s", memif_strerror (err));
-    c->rx_buf_num -= fb;
-
-    DBG ("freed %d buffers. %u/%u alloc/free buffers",
-                fb, c->rx_buf_num, MAX_MEMIF_BUFS - c->rx_buf_num);
-
-    icmpr_tx_burst (index, qid);
-
+    while (err == MEMIF_ERR_NOBUF);
     return 0;
 
 error:
@@ -428,6 +445,8 @@ icmpr_memif_create (long index, long mode)
     c->ip_addr[1] = 168;
     c->ip_addr[2] = c->index + 1;
     c->ip_addr[3] = 2;
+
+    c->pps_rx = 0;
     return 0;
 }
 
@@ -602,6 +621,110 @@ icmpr_set_rx_mode (long index, long qid, char* mode)
     return 0;
 }
 
+void *
+icmpr_pg (void *data)
+{
+    memif_connection_t *c = data;
+    uint8_t daddr[4];
+    uint16_t tx;
+    int i;
+    int err;
+
+    INFO ("Packet generator thread starts! interface id: %d", c->index);
+
+    while (1)
+    {
+        /* test buffer size performance */
+        err = memif_buffer_alloc (c->conn, 0, c->tx_bufs, 128, &tx);
+        if ((err != MEMIF_ERR_SUCCESS) && (err != MEMIF_ERR_NOBUF_RING))
+        {
+            INFO ("memif_buffer_alloc: %s", memif_strerror (err));
+            goto error;
+        }
+        c->tx_buf_num += tx;
+
+        i = 0;
+
+        while (tx)
+        {
+            while (tx > 2)
+            {
+                generate_packet ((void *) c->tx_bufs[i].data,
+                    &c->tx_bufs[i].data_len, c->ip_addr, c->ip_daddr);
+                generate_packet ((void *) c->tx_bufs[i + 1].data,
+                    &c->tx_bufs[i + i].data_len, c->ip_addr, c->ip_daddr);
+
+            tx -= 2;
+            i += 2;
+            }
+
+            generate_packet ((void *) c->tx_bufs[i].data,
+                &c->tx_bufs[i].data_len, c->ip_addr, c->ip_daddr);
+            tx--;
+            i++;
+        }
+
+        icmpr_tx_burst (c->index, 0);
+    }
+
+error:
+    INFO ("Packet generator thread exits! interface id: %d", c->index);
+    pthread_exit (NULL);
+}
+
+int
+icmpr_pg_start (long index)
+{
+    if (index >= MAX_CONNS)
+    {
+        INFO ("connection array overflow");
+        return 0;
+    }
+    if (index < 0)
+    {
+        INFO ("don't even try...");
+        return 0;
+    }
+    memif_connection_t *c = &memif_connection[index];
+    if (c->conn == NULL)
+    {
+        INFO ("no connection at index %ld", index);
+        return 0;
+    }
+    
+    pthread_create (&thread[index], NULL, icmpr_pg, (void *) c);
+
+    return 0;
+}
+
+int
+icmpr_pg_stop (long index)
+{
+    if (index >= MAX_CONNS)
+    {
+        INFO ("connection array overflow");
+        return 0;
+    }
+    if (index < 0)
+    {
+        INFO ("don't even try...");
+        return 0;
+    }
+    memif_connection_t *c = &memif_connection[index];
+    if (c->conn == NULL)
+    {
+        INFO ("no connection at index %ld", index);
+        return 0;
+    }
+
+    void *ptr;
+
+    pthread_kill (thread[index], SIGINT);
+    pthread_join (thread[index], &ptr);
+
+    return 0;
+}
+
 int
 user_input_handler ()
 {
@@ -646,6 +769,24 @@ user_input_handler ()
         ui = strtok (NULL, " ");
         if (ui != NULL)
             icmpr_memif_delete (strtol (ui, &end, 10));
+        else
+            INFO ("expected id");
+        goto done;
+    }
+    else if (strncmp (ui, "pg-start", 8) == 0)
+    {
+        ui = strtok (NULL, " ");
+        if (ui != NULL)
+            icmpr_pg_start (strtol (ui, &end, 10));
+        else
+            INFO ("expected id");
+        goto done;
+    }
+    else if (strncmp (ui, "pg-stop", 7) == 0)
+    {
+        ui = strtok (NULL, " ");
+        if (ui != NULL)
+            icmpr_pg_stop (strtol (ui, &end, 10));
         else
             INFO ("expected id");
         goto done;
@@ -700,6 +841,7 @@ poll_event (int timeout)
     int app_err = 0, memif_err = 0, en = 0;
     int tmp, nfd;
     uint32_t events = 0;
+    uint64_t b;
     memset (&evt, 0, sizeof (evt));
     evt.events = EPOLLIN | EPOLLOUT;
     sigset_t sigset;
@@ -712,8 +854,16 @@ poll_event (int timeout)
     }
     if (en > 0)
     {
-    /* this app does not use any other file descriptors than stds and memif control fds */
-        if ( evt.data.fd > 2)
+        if (evt.data.fd == timerfd)
+        {
+            b = read (timerfd, &b, sizeof (b));
+            memif_connection_t *c = &memif_connection[0];
+            if (c->conn == NULL)
+                return 0;
+            printf ("%ld pps\n", c->pps_rx);
+            c->pps_rx = 0;
+        }    
+        else if (evt.data.fd > 2)
         {
             /* event of memif control fd */
             /* convert epolle events to memif events */
@@ -771,10 +921,21 @@ int main ()
     
     print_help ();
 
+    timerfd = timerfd_create (CLOCK_REALTIME, TFD_NONBLOCK);
+
+    arm.it_value.tv_sec = 1;
+    arm.it_value.tv_nsec = 0;
+    arm.it_interval.tv_sec = 1;
+    arm.it_interval.tv_nsec = 0;
+
+    add_epoll_fd (timerfd, EPOLLIN);
+
+    timerfd_settime (timerfd, 0, &arm, NULL);
+
     /* main loop */
     while (1)
     {
-        if (poll_event (-1) < 0)
+        if (poll_event (0) < 0)
         {
             DBG ("poll_event error!");
         }
